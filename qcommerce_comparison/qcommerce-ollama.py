@@ -1,19 +1,23 @@
 from langchain_community.document_loaders import AsyncChromiumLoader
 from playwright.async_api import async_playwright
 from langchain.document_transformers import BeautifulSoupTransformer
-from langchain.chains import create_extraction_chain
-from langchain_openai import ChatOpenAI
+# from langchain.chains import create_extraction_chain
+# from langchain_openai import ChatOpenAI
+# from langchain_anthropic import ChatAnthropic
+from langchain_ollama.chat_models import ChatOllama
 from langchain_core.documents import Document
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
 import asyncio
 import nest_asyncio
 import os
-import openai
+# import openai
+# import anthropic
 from functools import lru_cache
 import logging
 from asyncio import Semaphore
 from typing import Dict, List
+import json
 
 nest_asyncio.apply()
 logging.basicConfig(level=logging.INFO)
@@ -22,14 +26,17 @@ logger = logging.getLogger(__name__)
 from dotenv import load_dotenv, find_dotenv
 _ = load_dotenv(find_dotenv())
 
-openai.api_key = os.environ['OPENAI_API_KEY']
+# openai.api_key = os.environ['OPENAI_API_KEY']
+# anthropic.api_key = os.environ['ANTHROPIC_API_KEY']
 
 import warnings
 warnings.filterwarnings('ignore')
 
 class QuickProductScraper:
     def __init__(self, max_concurrent_requests: int = 5):
-        self.llm = ChatOpenAI(temperature=0, model="gpt-4o-mini")
+        # self.llm = ChatOpenAI(temperature=0, model="gpt-4o-mini")
+        # self.llm = ChatAnthropic(temperature=0, model="claude-3.5-sonnet-20241022")
+        self.llm = ChatOllama(temperature=0, model="llama3.2")
         self.browser = None
         self.context = None
         self.semaphore = Semaphore(max_concurrent_requests)
@@ -77,33 +84,81 @@ class QuickProductScraper:
             raise
         finally:
             await page.close()
-
+    
     async def search_products(self, product_name: str, url: str) -> List[Dict]:
         async with self.semaphore:
             try:
                 search_url = f"{url}={product_name}"
                 logger.info(f"Searching: {search_url}")
-                
                 content = await self.get_page_content(search_url)
+                
                 bs_transformer = BeautifulSoupTransformer()
                 docs = bs_transformer.transform_documents(
                     [Document(page_content=content, metadata={})]
                 )
-
-                chain = create_extraction_chain(self.schema, self.llm)
+                
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", """Extract product information in the following format:
+                    [
+                        {{
+                            "product_name": "exact product name",
+                            "price": "price in INR",
+                            "category": "product category"
+                        }}
+                    ]
+                    Only include products with clear prices and names."""),
+                    ("human", "{text}")
+                ])
+                
+                chain = prompt | self.llm | StrOutputParser()
+                
                 products = []
-                
                 for doc in docs:
-                    data = chain.run(doc.page_content)
-                    if isinstance(data, list):
-                        products.extend(data)
-                    else:
-                        products.append(data)
-                
+                    try:
+                        result = await chain.ainvoke({"text": doc.page_content})
+                        parsed_data = json.loads(result)
+                        if isinstance(parsed_data, list):
+                            products.extend(parsed_data)
+                        else:
+                            products.append(parsed_data)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse product data: {e}")
+                        continue
+                    
                 return products
+                
             except Exception as e:
                 logger.error(f"Error searching products: {e}")
                 return []
+
+
+
+    # async def search_products(self, product_name: str, url: str) -> List[Dict]:
+    #     async with self.semaphore:
+    #         try:
+    #             search_url = f"{url}={product_name}"
+    #             logger.info(f"Searching: {search_url}")
+                
+    #             content = await self.get_page_content(search_url)
+    #             bs_transformer = BeautifulSoupTransformer()
+    #             docs = bs_transformer.transform_documents(
+    #                 [Document(page_content=content, metadata={})]
+    #             )
+
+    #             chain = create_extraction_chain(self.schema, self.llm)
+    #             products = []
+                
+    #             for doc in docs:
+    #                 data = chain.run(doc.page_content)
+    #                 if isinstance(data, list):
+    #                     products.extend(data)
+    #                 else:
+    #                     products.append(data)
+                
+    #             return products
+    #         except Exception as e:
+    #             logger.error(f"Error searching products: {e}")
+    #             return []
 
 async def compare_results(product_name: str) -> str:
     companies = {
@@ -128,7 +183,9 @@ async def compare_results(product_name: str) -> str:
         )
         
         # Compare prices
-        model = ChatOpenAI(temperature=0, model="gpt-4o-mini")
+        # model = ChatOpenAI(temperature=0, model="gpt-4o-mini")
+        # model = ChatAnthropic(temperature=0, model="claude-3.5-sonnet-20241022")
+        model = ChatOllama(temperature=0, model="llama3.2")
         compare_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are a price comparison expert. Extract product names and prices, then: \
                 1. Match identical products across companies \
